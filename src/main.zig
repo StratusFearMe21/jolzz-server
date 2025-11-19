@@ -11,5 +11,5 @@ pub fn main() !void {
     var jolzz_server = try JolzzServer.init(gpa.allocator(), server_ip, server_port);
     defer jolzz_server.deinit();
 
-    jolzz_server.runSocket();
+    jolzz_server.connectionListener();
 }
