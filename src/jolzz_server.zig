@@ -92,6 +92,10 @@ pub const JolzzServer = struct {
         upgradeConnection(websocket, header_data) catch
             @panic("An error occured while upgrading the connection");
 
+        websocketMessage(websocket, "hello js from zig!") catch {
+            std.debug.print("WebSocket write failed\n", .{});
+        };
+
         while (!shutdown_server.*) {
             var buffer: [4096]u8 = undefined;
             websocketRead(websocket, &buffer) catch {
@@ -210,14 +214,54 @@ pub const JolzzServer = struct {
         return frame;
     }
 
-    fn websocketMessage(websocket: *WebSocketInstance, message: []const u8) !void {
+    fn websocketMessage(websocket: *WebSocketInstance, payload: []const u8) !void {
         var buffer: [4096]u8 = undefined;
-        createFrame(&buffer);
-        try websocket.connection.stream.write(message);
+        var seek: usize = 0;
+        createFrame(&seek, &buffer, payload);
+        _ = try websocket.connection.stream.write(buffer[0..seek]);
     }
 
-    fn createFrame(buffer: []u8) []const u8 {
-        _ = buffer;
+    fn createFrame(seek: *usize, buffer: []u8, payload: []const u8) void {
+        const fin: u8 = 0x80;
+        const opcode: u8 = 1;
+        const payload_bits: u8 = payload_blk: {
+            if (payload.len <= 125) {
+                break :payload_blk @intCast(payload.len);
+            } else if (payload.len <= 0xFFFF) {
+                break :payload_blk 126;
+            } else {
+                break :payload_blk 127;
+            }
+        };
+
+        buffer[seek.*] = fin + opcode;
+        seek.* += 1;
+
+        buffer[seek.*] = payload_bits;
+        seek.* += 1;
+
+        switch (payload_bits) {
+            126 => {
+                buffer[seek.*] = @intCast((payload.len >> 8) & 0xFF);
+                buffer[seek.* + 1] = @intCast(payload.len & 0xFF);
+                seek.* += 2;
+            },
+            127 => {
+                for (0..8) |i| {
+                    const current_byte: usize = seek.* + i;
+                    const offset_byte: u6 = @intCast((7 - i) * 8);
+                    buffer[current_byte] = @intCast((payload.len >> offset_byte) & 0xFF);
+                }
+
+                seek.* += 8;
+            },
+            else => {},
+        }
+
+        for (0..payload.len) |i|
+            buffer[seek.* + i] = payload[i];
+
+        seek.* += payload.len;
     }
 
     inline fn getSwitchingProtocolsResponse() []const u8 {
@@ -264,7 +308,5 @@ const WebSocketInstance = struct {
 
     pub fn deinit(websocket: WebSocketInstance) void {
         websocket.connection.stream.close();
-        // websocket.allocator.free(websocket.reader.buffer);
-        // websocket.allocator.free(websocket.writer.buffer);
     }
 };

@@ -11,6 +11,6 @@ websocket.onopen = () => {
   websocket.send("testing the inputs!");
 }
 
-websocket.onmessage = () => {
-    
+websocket.onmessage = (event) => {
+  console.log(event.data);
 }
