@@ -4,18 +4,13 @@ const Server = net.Server;
 const Connection = Server.Connection;
 const Allocator = std.mem.Allocator;
 
-const ServerError = error{
-    HeaderMalformed,
-    MethodNotSupported,
-    ProtoNotSupported,
-};
-
 pub const JolzzServer = struct {
     ip: []const u8,
     port: u16,
     server: Server,
     allocator: Allocator,
     connections: std.array_list.Aligned(std.Thread, null),
+    websocket_instances: std.array_list.Aligned(WebSocketInstance, null),
     shutdown_server: bool = false,
 
     const Self = @This();
@@ -31,7 +26,8 @@ pub const JolzzServer = struct {
             .port = port,
             .server = listener,
             .allocator = allocator,
-            .connections = try std.ArrayList(std.Thread).initCapacity(allocator, 1),
+            .connections = try std.ArrayList(std.Thread).initCapacity(allocator, 8),
+            .websocket_instances = try std.ArrayList(WebSocketInstance).initCapacity(allocator, 8),
         };
     }
 
@@ -42,30 +38,40 @@ pub const JolzzServer = struct {
         for (self.connections.items) |connection|
             connection.join();
 
+        for (self.websocket_instances.items) |websocket|
+            websocket.deinit();
+
         self.connections.deinit(self.allocator);
+        self.websocket_instances.deinit(self.allocator);
     }
 
     pub fn connectionListener(self: *Self) void {
         while (getConnection(&self.server)) |connection| {
             std.debug.print("Found listener\n", .{});
+
+            var websocket = WebSocketInstance.init(self.allocator, connection) catch
+                @panic("Could not create WebSocketInstance");
+            errdefer websocket.deinit();
+
             const thread = std.Thread.spawn(
                 .{ .allocator = self.allocator },
                 runSocket,
-                .{ self.allocator, connection, &self.shutdown_server },
+                .{ &websocket, &self.shutdown_server },
             ) catch |err| {
                 std.debug.print("Could not make thread: {any}", .{err});
                 return;
             };
 
             self.connections.append(self.allocator, thread) catch @panic("OOM");
+            self.websocket_instances.append(self.allocator, websocket) catch @panic("OOM");
         }
     }
 
-    fn runSocket(allocator: Allocator, connection: Connection, shutdown_server: *bool) void {
+    fn runSocket(websocket: *WebSocketInstance, shutdown_server: *bool) void {
         var receive_buffer: [4096]u8 = undefined;
         var header_offset: usize = 0;
 
-        while (readFromConnection(connection, receive_buffer[header_offset..])) |receive_length| {
+        while (readFromConnection(websocket, receive_buffer[header_offset..])) |receive_length| {
             header_offset += receive_length;
             const header_termination = std.mem.containsAtLeast(
                 u8,
@@ -83,18 +89,23 @@ pub const JolzzServer = struct {
             return;
         }
 
-        upgradeConnection(allocator, header_data, connection) catch
+        upgradeConnection(websocket, header_data) catch
             @panic("An error occured while upgrading the connection");
 
-        while (!shutdown_server.*) {}
+        while (!shutdown_server.*) {
+            var buffer: [4096]u8 = undefined;
+            websocketRead(websocket, &buffer) catch {
+                std.debug.print("WebSocket read failed\n", .{});
+            };
+        }
     }
 
-    fn upgradeConnection(allocator: Allocator, header_data: []const u8, connection: Connection) !void {
+    fn upgradeConnection(websocket: *WebSocketInstance, header_data: []const u8) !void {
         var connection_upgrade = false;
         var websocket_upgrade = false;
         var websocket_version = false;
         var obtained_client_key = false;
-        var sec_client_key = std.mem.zeroes([24]u8);
+        var sec_client_key: [24]u8 = undefined;
         var iterator = std.mem.splitAny(u8, header_data, "\r\n");
         while (iterator.next()) |header| {
             if (!connection_upgrade)
@@ -113,10 +124,10 @@ pub const JolzzServer = struct {
             }
         }
 
-        const sec_server_key = try generateServerKey(allocator, &sec_client_key);
-        defer allocator.free(sec_server_key);
+        const sec_server_key = try generateServerKey(websocket.allocator, &sec_client_key);
+        defer websocket.allocator.free(sec_server_key);
         if (connection_upgrade and websocket_upgrade and websocket_version and obtained_client_key) {
-            var writer = connection.stream.writer(&.{});
+            var writer = websocket.connection.stream.writer(&.{});
             try writer.interface.print(getSwitchingProtocolsResponse(), .{sec_server_key});
             std.debug.print("Connection upgrading\n", .{});
         } else std.debug.print("Not all values supplied for opening the connection\n", .{});
@@ -138,6 +149,77 @@ pub const JolzzServer = struct {
         return encoder.encode(base64_result, &sha1_result);
     }
 
+    fn websocketRead(websocket: *WebSocketInstance, buffer: []u8) !void {
+        const message_length = try websocket.connection.stream.read(buffer);
+        var seek: usize = 0;
+
+        while (seek < message_length) {
+            const frame = parseFrame(&seek, buffer) orelse continue;
+            std.debug.print("{s}\n", .{frame});
+        }
+    }
+
+    fn parseFrame(seek: *usize, buffer: []u8) ?[]const u8 {
+        const fin = (buffer[seek.*] & 0x80) != 0;
+        const opcode = buffer[seek.*] & 0x0F;
+        seek.* += 1;
+
+        const is_masked = (buffer[seek.*] & 0x80) != 0;
+        var payload_len: usize = buffer[seek.*] & 0x7F;
+        seek.* += 1;
+
+        if (!fin) {
+            std.debug.print("Fragmenting messages not supported\n", .{});
+            return null;
+        }
+
+        if (opcode != 1) {
+            std.debug.print("Only text is valid for messages\n", .{});
+            return null;
+        }
+
+        if (payload_len == 126) {
+            const current_byte: usize = buffer[seek.*];
+            const next_byte: usize = buffer[seek.* + 1];
+            payload_len = (current_byte << 8) + next_byte;
+            seek.* += 2;
+        } else if (payload_len == 127) {
+            payload_len = 0;
+            for (0..8) |i| {
+                const current_byte: usize = buffer[i + seek.*];
+                const offset_byte: u6 = @intCast((7 - i) * 8);
+                payload_len += current_byte << offset_byte;
+            }
+
+            seek.* += 8;
+        }
+
+        if (is_masked) {
+            const mask_key = buffer[seek.* .. seek.* + 4];
+            seek.* += 4;
+
+            for (0..payload_len) |i| {
+                const payload_index = seek.* + i;
+                buffer[payload_index] = buffer[payload_index] ^ mask_key[i % 4];
+            }
+        }
+
+        const frame = buffer[seek.* .. seek.* + payload_len];
+        seek.* += payload_len;
+
+        return frame;
+    }
+
+    fn websocketMessage(websocket: *WebSocketInstance, message: []const u8) !void {
+        var buffer: [4096]u8 = undefined;
+        createFrame(&buffer);
+        try websocket.connection.stream.write(message);
+    }
+
+    fn createFrame(buffer: []u8) []const u8 {
+        _ = buffer;
+    }
+
     inline fn getSwitchingProtocolsResponse() []const u8 {
         return "HTTP/1.1 101 Switching Protocols\r\n" ++
             "Upgrade: websocket\r\n" ++
@@ -153,8 +235,36 @@ pub const JolzzServer = struct {
         };
     }
 
-    fn readFromConnection(connection: Connection, buffer: []u8) ?usize {
-        const length = connection.stream.read(buffer) catch return null;
+    fn readFromConnection(websocket: *WebSocketInstance, buffer: []u8) ?usize {
+        const length = websocket.connection.stream.read(buffer) catch return null;
         return if (length > 0) length else null;
+    }
+};
+
+const WebSocketInstance = struct {
+    allocator: Allocator,
+    connection: Connection,
+    server: *std.http.Server,
+
+    pub fn init(allocator: Allocator, connection: Connection) !WebSocketInstance {
+        const reader_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
+        var stream_reader = connection.stream.reader(reader_buffer);
+
+        const writer_buffer: []u8 = try allocator.alloc(u8, std.heap.pageSize());
+        var stream_writer = connection.stream.writer(writer_buffer);
+
+        var server = std.http.Server.init(stream_reader.interface(), &stream_writer.interface);
+
+        return .{
+            .allocator = allocator,
+            .connection = connection,
+            .server = &server,
+        };
+    }
+
+    pub fn deinit(websocket: WebSocketInstance) void {
+        websocket.connection.stream.close();
+        // websocket.allocator.free(websocket.reader.buffer);
+        // websocket.allocator.free(websocket.writer.buffer);
     }
 };
